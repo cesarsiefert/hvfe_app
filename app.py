@@ -113,7 +113,7 @@ def plot_pie(area_by_class: dict, scenario: str):
     st.pyplot(fig)
 
 # ------------------- Streamlit UI -------------------
-st.title("HVFE (GEE) — Clip + Estatística por Classe")
+st.title("HVFE (GEE) — Clip + Statistics per Class")
 
 scenario = st.selectbox("Cenário:", ["MIN", "MAX"])
 scale = st.number_input("Scale (m):", value=30)
@@ -126,6 +126,6 @@ if uploaded_file:
     ee_geom = ee_fc.geometry()
     img = get_hvfe_image(scenario)
 
-    if st.button("Gerar gráfico de pizza"):
+    if st.button("Create a pie chart"):
         area_by_class = compute_area_by_class(img, ee_geom, scale)
         plot_pie(area_by_class, scenario)
