@@ -15,89 +15,105 @@ import ee
 import folium
 from streamlit_folium import st_folium
 
+import base64
+import hashlib
+import os
+import streamlit as st
+import ee
+import google.oauth2.credentials
 
 # -----------------------------
 # EE Authentication helpers (per-user)
 # -----------------------------
-def ee_login_ui() -> Tuple[bool, Optional[str]]:
-    """Interactive, per-session EE login.
+def _b64url_no_pad(b: bytes) -> str:
+    """Base64-url encode without '=' padding (PKCE requirement)."""
+    return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
 
-    Why this exists:
-      - In a public Streamlit app, each visitor should authenticate with THEIR own
-        Google account so that Export.toDrive saves to THEIR Drive.
-      - ee.Authenticate() browser popups are unreliable on hosted Streamlit.
-        This flow uses an auth link + pasted verification code.
-
-    Returns:
-      (ok, project_id)
+def _make_pkce_pair() -> tuple[str, str]:
     """
+    Returns (code_verifier, code_challenge) for PKCE S256.
+    """
+    code_verifier = _b64url_no_pad(os.urandom(32))
+    digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+    code_challenge = _b64url_no_pad(digest)
+    return code_verifier, code_challenge
 
-    # Already initialized for this browser session
-    if st.session_state.get("ee_initialized", False):
-        return True, st.session_state.get("ee_project_id")
-
+def ee_login_ui():
     st.subheader("Google Earth Engine login")
 
-    # Let each user use their own Cloud Project.
-    default_project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     project_id = st.text_input(
-        "Your Google Cloud Project ID (with Earth Engine enabled)",
-        value=st.session_state.get("ee_project_id", default_project),
+        "Your Google Cloud Project ID (with Earth Engine API enabled)",
+        value=st.session_state.get("ee_project_id", ""),
         placeholder="e.g., my-ee-project-123",
-    ).strip()
+    )
     st.session_state["ee_project_id"] = project_id
 
+    if st.session_state.get("ee_initialized", False):
+        st.success("Earth Engine is connected for this session.")
+        return True, project_id
+
     st.info(
-        "To export to **your own Google Drive**, you must authenticate with your Google account. "
-        "Exports will be saved in the Drive of the account you use here."
+        "To export to your own Google Drive, you must authenticate with your Google account. "
+        "Exports will be saved in the Drive of the account used here."
     )
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        if st.button("🔐 Generate authentication link", use_container_width=True):
-            try:
-                st.session_state["ee_auth_url"] = ee.oauth.get_authorization_url()
-            except Exception as e:
-                st.error(f"Could not generate authentication link: {e}")
+    # Step 1: generate PKCE + auth link
+    if st.button("🔐 Generate authentication link"):
+        try:
+            code_verifier, code_challenge = _make_pkce_pair()
+            st.session_state["ee_code_verifier"] = code_verifier
+            auth_url = ee.oauth.get_authorization_url(code_challenge=code_challenge)
+            st.session_state["ee_auth_url"] = auth_url
+        except Exception as e:
+            st.error(f"Could not generate authentication link: {e}")
 
     auth_url = st.session_state.get("ee_auth_url")
     if auth_url:
-        st.markdown("**Step 1**: Open this link, choose your Google account, and allow access:")
-        st.markdown(auth_url)
-        st.markdown("**Step 2**: Copy the verification code and paste below:")
+        st.markdown("1) Open this link and authorize:")
+        st.code(auth_url)
+        st.markdown("2) Copy the verification code and paste it below:")
 
-        code = st.text_input("Verification code", type="password")
-        with colB:
-            if st.button("✅ Verify & connect", use_container_width=True):
-                if not code.strip():
-                    st.warning("Paste the verification code to continue.")
-                    return False, project_id or None
-                try:
-                    token = ee.oauth.request_token(code.strip())
-                    credentials = ee.oauth.Credentials(token)
-                    if project_id:
-                        ee.Initialize(credentials, project=project_id)
-                    else:
-                        ee.Initialize(credentials)
+        auth_code = st.text_input("Verification code", type="password")
 
-                    # Quick sanity check (also surfaces permission issues early)
-                    _ = ee.Image(1).getInfo()
+        if st.button("✅ Verify code and connect"):
+            try:
+                code_verifier = st.session_state.get("ee_code_verifier")
+                if not code_verifier:
+                    st.error("Missing PKCE verifier. Click 'Generate authentication link' again.")
+                    return False, project_id
 
-                    st.session_state["ee_initialized"] = True
-                    st.success("Connected! You can now upload an AOI and use map/stats/export.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(
-                        "Authentication/initialization failed. "
-                        "Make sure your account has Earth Engine access and your Cloud Project has the Earth Engine API enabled.\n\n"
-                        f"Details: {e}"
-                    )
+                refresh_token = ee.oauth.request_token(
+                    auth_code=auth_code.strip(),
+                    code_verifier=code_verifier,
+                )
 
-    st.caption(
-        "If you don't have Earth Engine access yet, request it in the Earth Engine sign-up page, "
-        "and ensure you have a Google Cloud Project with the Earth Engine API enabled."
-    )
-    return False, project_id or None
+                creds = google.oauth2.credentials.Credentials(
+                    token=None,
+                    refresh_token=refresh_token,
+                    token_uri=ee.oauth.TOKEN_URI,
+                    client_id=ee.oauth.CLIENT_ID,
+                    client_secret=ee.oauth.CLIENT_SECRET,
+                    scopes=ee.oauth.SCOPES,
+                )
+
+                if project_id.strip():
+                    ee.Initialize(credentials=creds, project=project_id.strip())
+                else:
+                    ee.Initialize(credentials=creds)
+
+                st.session_state["ee_initialized"] = True
+                st.success("Connected! You can now use the map/stats/export.")
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Authentication failed: {e}")
+
+    if st.button("🚪 Log out (reset EE session)"):
+        for k in ["ee_initialized", "ee_auth_url", "ee_code_verifier"]:
+            st.session_state.pop(k, None)
+        st.rerun()
+
+    return False, project_id
 
 
 # -----------------------------
