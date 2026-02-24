@@ -17,24 +17,87 @@ from streamlit_folium import st_folium
 
 
 # -----------------------------
-# EE Initialization helpers
+# EE Authentication helpers (per-user)
 # -----------------------------
-@st.cache_resource(show_spinner=False)
-def init_ee():
+def ee_login_ui() -> Tuple[bool, Optional[str]]:
+    """Interactive, per-session EE login.
+
+    Why this exists:
+      - In a public Streamlit app, each visitor should authenticate with THEIR own
+        Google account so that Export.toDrive saves to THEIR Drive.
+      - ee.Authenticate() browser popups are unreliable on hosted Streamlit.
+        This flow uses an auth link + pasted verification code.
+
+    Returns:
+      (ok, project_id)
     """
-    Initialize Earth Engine with a Cloud project:
-    1) Use GOOGLE_CLOUD_PROJECT env var if set
-    2) Otherwise, use your explicit project id (edit below)
-    Falls back to interactive Authenticate().
-    """
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "hvfe-ee-project")
-    try:
-        ee.Initialize(project=project_id)
-        return project_id
-    except Exception:
-        ee.Authenticate()
-        ee.Initialize(project=project_id)
-        return project_id
+
+    # Already initialized for this browser session
+    if st.session_state.get("ee_initialized", False):
+        return True, st.session_state.get("ee_project_id")
+
+    st.subheader("Google Earth Engine login")
+
+    # Let each user use their own Cloud Project.
+    default_project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
+    project_id = st.text_input(
+        "Your Google Cloud Project ID (with Earth Engine enabled)",
+        value=st.session_state.get("ee_project_id", default_project),
+        placeholder="e.g., my-ee-project-123",
+    ).strip()
+    st.session_state["ee_project_id"] = project_id
+
+    st.info(
+        "To export to **your own Google Drive**, you must authenticate with your Google account. "
+        "Exports will be saved in the Drive of the account you use here."
+    )
+
+    colA, colB = st.columns([1, 1])
+    with colA:
+        if st.button("🔐 Generate authentication link", use_container_width=True):
+            try:
+                st.session_state["ee_auth_url"] = ee.oauth.get_authorization_url()
+            except Exception as e:
+                st.error(f"Could not generate authentication link: {e}")
+
+    auth_url = st.session_state.get("ee_auth_url")
+    if auth_url:
+        st.markdown("**Step 1**: Open this link, choose your Google account, and allow access:")
+        st.markdown(auth_url)
+        st.markdown("**Step 2**: Copy the verification code and paste below:")
+
+        code = st.text_input("Verification code", type="password")
+        with colB:
+            if st.button("✅ Verify & connect", use_container_width=True):
+                if not code.strip():
+                    st.warning("Paste the verification code to continue.")
+                    return False, project_id or None
+                try:
+                    token = ee.oauth.request_token(code.strip())
+                    credentials = ee.oauth.Credentials(token)
+                    if project_id:
+                        ee.Initialize(credentials, project=project_id)
+                    else:
+                        ee.Initialize(credentials)
+
+                    # Quick sanity check (also surfaces permission issues early)
+                    _ = ee.Image(1).getInfo()
+
+                    st.session_state["ee_initialized"] = True
+                    st.success("Connected! You can now upload an AOI and use map/stats/export.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(
+                        "Authentication/initialization failed. "
+                        "Make sure your account has Earth Engine access and your Cloud Project has the Earth Engine API enabled.\n\n"
+                        f"Details: {e}"
+                    )
+
+    st.caption(
+        "If you don't have Earth Engine access yet, request it in the Earth Engine sign-up page, "
+        "and ensure you have a Google Cloud Project with the Earth Engine API enabled."
+    )
+    return False, project_id or None
 
 
 # -----------------------------
@@ -326,9 +389,10 @@ st.caption(
     "extract class shares; and export the clipped raster to Google Drive."
 )
 
-# Initialize EE once
-with st.spinner("Initializing Earth Engine..."):
-    project_used = init_ee()
+# Per-user EE login (required for Drive export to each user's Drive)
+ok, project_used = ee_login_ui()
+if not ok:
+    st.stop()
 
 # Session state defaults
 if "geom" not in st.session_state:
