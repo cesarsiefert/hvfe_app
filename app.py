@@ -1,93 +1,73 @@
+# Author: Cesar A.C. Siefert
+# This code was developed by Cesar Siefert. AI tools (Microsoft 365 Copilot) were used to assist with code refinement, debugging, and structural suggestions. All final implementation decisions and validation were performed by the author.
+
+# Streamlit dashboard: HVFE Clip + Map + Stats + Export to Google Drive
+
 import os
 import io
+import json
 import zipfile
 import tempfile
-from datetime import datetime
+from typing import Dict, Tuple, List, Optional
 
 import streamlit as st
 import ee
-import geopandas as gpd
-from shapely.ops import unary_union
-from shapely.geometry import mapping
 import folium
 from streamlit_folium import st_folium
-import plotly.express as px
-import requests
 
 
-# ----------------------------
-# Page config
-# ----------------------------
-st.set_page_config(
-    page_title="HVFE App - Clipping and Stats",
-    layout="wide",
-)
-
-st.title("HVFE App – Clip & Stats (GEE)")
-st.caption("Upload a zipped shapefile, select MIN or MAX raster, clip, visualize, chart stats, and download the clipped raster (no Drive export).")
-
-
-# ----------------------------
-# GEE Initialization
-# ----------------------------
+# -----------------------------
+# EE Initialization helpers
+# -----------------------------
+@st.cache_resource(show_spinner=False)
 def init_ee():
-    """Initialize Google Earth Engine with priority:
-    1) Service account using env vars
-    2) Existing initialization
-    3) Interactive user authentication (local)
     """
+    Initialize Earth Engine with a Cloud project:
+    1) Use GOOGLE_CLOUD_PROJECT env var if set
+    2) Otherwise, use your explicit project id (edit below)
+    Falls back to interactive Authenticate().
+    """
+    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT", "hvfe-ee-project")
     try:
-        if ee.data._initialized:
-            return
+        ee.Initialize(project=project_id)
+        return project_id
     except Exception:
-        pass
-
-    service_account = os.getenv("EE_SERVICE_ACCOUNT")
-    service_key_json = os.getenv("EE_PRIVATE_KEY_JSON")  # full JSON string
-
-    try:
-        if service_account and service_key_json:
-            credentials = ee.ServiceAccountCredentials(
-                service_account=service_account,
-                key_data=service_key_json,
-            )
-            ee.Initialize(credentials)
-        else:
-            # Try default initialize first (works if EE is already authenticated on host)
-            ee.Initialize()
-    except Exception:
-        # Fallback to user authentication (local dev)
         ee.Authenticate()
-        ee.Initialize()
-
-init_ee()
-
-
-# ----------------------------
-# Constants: classes, palette, visualization
-# ----------------------------
-names = [
-    'Surface Water',
-    'Regularly Flooded wetlands',
-    'Headwater regions',
-    'Fixed‐width buffer (low‐order streams)',
-    'Fixed‐width buffer (high‐order streams)',
-    'Geomorphic floodplains',
-    'Fixed‐width buffer (regularly flooded wetlands)'
-]
-
-palette = ['#65cbd6', '#20456e', '#206e35', '#f4fc08', '#fc0808', '#d69a65', '#d665b8']
-
-fwc_vis = dict(min=1, max=7, palette=palette)
+        ee.Initialize(project=project_id)
+        return project_id
 
 
-# ----------------------------
-# Build the HVFE images (MAX and MIN mosaics)
-# ----------------------------
-def get_fwc_image(choice: str) -> ee.Image:
-    """Return the HVFE image mosaic for 'MIN' or 'MAX'."""
-    if choice == "MAX":
-        fwc_max = ee.ImageCollection([
+# -----------------------------
+# Constants and class labels
+# -----------------------------
+SCALE_M = 30  # fixed 30 m resolution for stats and export
+
+MIN_CLASS_LABELS = {
+    1: "Surface water",
+    2: "Regularly flooded wetlands",
+    3: "Headwater regions",
+    4: "Fixed-width buffer around low-order streams (stream orders 1–3)",
+    5: "Fixed-width buffer around surface water and high-order streams (orders ≥4)",
+}
+
+MAX_CLASS_LABELS = {
+    **MIN_CLASS_LABELS,
+    6: "Geomorphic floodplains",
+    7: "Wetland buffer corridors",
+}
+
+PALETTE_EE = ["65cbd6", "20456e", "206e35", "f4fc08", "fc0808", "d69a65", "d665b8"]
+PALETTE_HEX = ["#" + c for c in PALETTE_EE]
+
+FWC_VIS = {"min": 1, "max": 7, "palette": PALETTE_EE}
+
+
+# -----------------------------
+# Rasters (MIN/MAX)
+# -----------------------------
+def get_fwc_max() -> ee.Image:
+    return ee.ImageCollection(
+        [
             ee.Image("projects/ee-vsgriffey/assets/riparian_max_tile1_V2"),
             ee.Image("projects/ee-vsgriffey/assets/riparian_max_tile2_V2"),
             ee.Image("projects/ee-vsgriffey/assets/riparian_max_tile3_V2"),
@@ -96,11 +76,14 @@ def get_fwc_image(choice: str) -> ee.Image:
             ee.Image("projects/ee-vsgriffey/assets/riparian_max_tile6_V2"),
             ee.Image("projects/ee-vsgriffey/assets/riparian_max_tile7_V2"),
             ee.Image("projects/ee-vsgriffey/assets/riparian_max_tile8_V2"),
-            ee.Image("projects/ee-vsgriffey/assets/riparian_max_tile9_V2")
-        ]).mosaic()
-        return fwc_max
-    else:
-        fwc_min = ee.ImageCollection([
+            ee.Image("projects/ee-vsgriffey/assets/riparian_max_tile9_V2"),
+        ]
+    ).mosaic()
+
+
+def get_fwc_min() -> ee.Image:
+    return ee.ImageCollection(
+        [
             ee.Image("projects/ee-vsgriffey/assets/riparian_full_min_tile1_V2"),
             ee.Image("projects/ee-vsgriffey/assets/riparian_full_min_tile2_V2"),
             ee.Image("projects/ee-vsgriffey/assets/riparian_full_min_tile3_V2"),
@@ -109,304 +92,437 @@ def get_fwc_image(choice: str) -> ee.Image:
             ee.Image("projects/ee-vsgriffey/assets/riparian_full_min_tile6_V2"),
             ee.Image("projects/ee-vsgriffey/assets/riparian_full_min_tile7_V2"),
             ee.Image("projects/ee-vsgriffey/assets/riparian_full_min_tile8_V2"),
-            ee.Image("projects/ee-vsgriffey/assets/riparian_full_min_tile9_V2")
-        ]).mosaic()
-        return fwc_min
+            ee.Image("projects/ee-vsgriffey/assets/riparian_full_min_tile9_V2"),
+        ]
+    ).mosaic()
 
 
-# ----------------------------
-# Helpers: shapefile upload -> ee.Geometry
-# ----------------------------
-def load_shapefile_from_zip(uploaded_zip_file) -> tuple[ee.Geometry, gpd.GeoDataFrame]:
-    """Read a zipped shapefile into a single ee.Geometry (union of features)."""
-    tmpdir = tempfile.mkdtemp()
-    with zipfile.ZipFile(uploaded_zip_file) as zf:
-        zf.extractall(tmpdir)
-
-    shp_files = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.lower().endswith(".shp")]
-    if not shp_files:
-        raise ValueError("No .shp file found in the uploaded ZIP.")
-
-    gdf = gpd.read_file(shp_files[0])
-    if gdf.empty or gdf.geometry.is_empty.all():
-        raise ValueError("The shapefile has no valid geometries.")
-
-    # Reproject to WGS84 for Earth Engine
-    gdf = gdf.to_crs(epsg=4326)
-
-    # Union all geometries to a single geometry (clip region)
-    union_geom = unary_union(gdf.geometry)
-    if union_geom.is_empty:
-        raise ValueError("Geometry (union) is empty after processing.")
-
-    ee_geom = ee.Geometry(mapping(union_geom), geodesic=False)
-    return ee_geom, gdf
+# -----------------------------
+# Shapefile upload & parsing
+# -----------------------------
+REQUIRED_EXTS = {".shp", ".shx", ".dbf", ".prj"}
 
 
-# ----------------------------
-# Folium helpers (EE tile layer + legend)
-# ----------------------------
-def add_ee_layer(m, ee_image, vis_params, name):
-    """Add an Earth Engine image layer to a folium map."""
-    map_id_dict = ee.Image(ee_image).getMapId(vis_params)
+def extract_zip_to_temp(uploaded_file) -> str:
+    tmpdir = tempfile.mkdtemp(prefix="shpzip_")
+    with zipfile.ZipFile(io.BytesIO(uploaded_file.read())) as z:
+        z.extractall(tmpdir)
+    return tmpdir
+
+
+def validate_shapefile_dir(folder: str) -> Tuple[bool, str]:
+    files = os.listdir(folder)
+    exts = {os.path.splitext(f)[1].lower() for f in files}
+    missing = REQUIRED_EXTS - exts
+    if missing:
+        return False, f"Missing required files: {', '.join(sorted(missing))}"
+    return True, ""
+
+
+def read_shapefile_to_geojson(folder: str) -> Dict:
+    import shapefile as pyshp
+
+    shp_path = None
+    for f in os.listdir(folder):
+        if f.lower().endswith(".shp"):
+            shp_path = os.path.join(folder, f)
+            break
+    if shp_path is None:
+        raise FileNotFoundError("No .shp file found in the ZIP.")
+
+    r = pyshp.Reader(shp_path)
+    fields = r.fields[1:]
+    field_names = [f[0] for f in fields]
+
+    features = []
+    for rec, shp in zip(r.records(), r.shapes()):
+        props = {name: rec[i] for i, name in enumerate(field_names)}
+        geom = shp.__geo_interface__
+        features.append({"type": "Feature", "geometry": geom, "properties": props})
+    return {"type": "FeatureCollection", "features": features}
+
+
+def geojson_to_ee_geometry(geojson_fc: Dict) -> ee.Geometry:
+    feats = [ee.Feature(ee.Geometry(f["geometry"])) for f in geojson_fc.get("features", [])]
+    if not feats:
+        raise ValueError("No geometries found in uploaded file.")
+    return ee.FeatureCollection(feats).geometry().dissolve()
+
+
+# -----------------------------
+# Visualization helpers
+# -----------------------------
+def add_ee_tile_layer(m: folium.Map, image: ee.Image, vis_params: Dict, name: str):
+    map_id = ee.Image(image).getMapId(vis_params)
     folium.raster_layers.TileLayer(
-        tiles=map_id_dict["tile_fetcher"].url_format,
+        tiles=map_id["tile_fetcher"].url_format,
         attr="Google Earth Engine",
         name=name,
         overlay=True,
         control=True,
-        opacity=0.85
     ).add_to(m)
 
 
-def add_legend(m, title, labels, colors):
-    """Add a simple HTML legend to folium map."""
-    legend_html = f"""
-    <div style="
-        position: fixed; 
-        bottom: 30px; left: 30px; z-index: 9999; 
-        background-color: rgba(255,255,255,0.9);
-        padding: 10px 12px; border: 1px solid #ccc; border-radius: 4px;
-        font-size: 13px;">
-      <b>{title}</b><br>
-    """
-    for lbl, col in zip(labels, colors):
-        legend_html += f"""
-        <div style="display:flex;align-items:center;margin:2px 0;">
-          <div style="width:12px;height:12px;background:{col};margin-right:6px;border:1px solid #666;"></div>
-          <span>{lbl}</span>
+def center_of_geometry(geom: ee.Geometry):
+    c = geom.centroid(1).coordinates().getInfo()
+    return float(c[1]), float(c[0])  # (lat, lon)
+
+
+def add_legend_to_map(m: folium.Map, label_map: Dict[int, str], palette_hex: List[str]):
+    items = ""
+    for cls in sorted(label_map.keys()):
+        color = palette_hex[cls - 1]
+        label = label_map[cls]
+        items += f"""
+        <div style="display:flex;align-items:center;margin:4px 0;line-height:1.2;">
+            <div style="width:14px;height:14px;background:{color};border:1px solid #999;border-radius:2px;margin-right:8px;flex-shrink:0;"></div>
+            <span style="font-size:12px;color:#222;">{cls}. {label}</span>
         </div>
         """
-    legend_html += "</div>"
+
+    legend_html = f"""
+    <div style="
+        position: fixed;
+        bottom: 28px;
+        left: 28px;
+        z-index: 9999;
+        background: rgba(250,250,250,0.95);
+        padding: 10px 12px;
+        border: 1px solid #E0E0E0;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.18);
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        max-width: 420px;
+    ">
+        <div style="font-weight:600;margin-bottom:6px;color:#222;">Legend</div>
+        {items}
+    </div>
+    """
     m.get_root().html.add_child(folium.Element(legend_html))
 
 
-# ----------------------------
-# Stats: area and percentage per class
-# ----------------------------
-def compute_area_stats(image: ee.Image, region: ee.Geometry, scale: int = 30) -> dict:
-    """
-    Compute area per class (1..7) in m² within the region.
-    Uses pixelArea and group reducer for robust area computation.
-    """
-    # Ensure it's a single-band classification named 'class'
-    class_img = image.rename('class').toInt16()
+# -----------------------------
+# Statistics helpers
+# -----------------------------
+def compute_area_by_classes(img: ee.Image, geom: ee.Geometry, classes: List[int], scale: int = SCALE_M) -> Dict[int, float]:
+    class_band = img.toInt().rename("class").unmask(0)
 
-    # Sum of pixelArea grouped by class
-    grouped = ee.Image.pixelArea().addBands(class_img).reduceRegion(
-        reducer=ee.Reducer.sum().group(groupField=1, groupName='class'),
-        geometry=region,
+    mask = None
+    for v in classes:
+        cond = class_band.eq(int(v))
+        mask = cond if mask is None else mask.Or(cond)
+    class_masked = class_band.updateMask(mask)
+
+    area_img = ee.Image.pixelArea().rename("area").reproject(crs=img.projection(), scale=scale)
+
+    reduced = area_img.addBands(class_masked).reduceRegion(
+        reducer=ee.Reducer.sum().group(groupField=1, groupName="class"),
+        geometry=geom,
         scale=scale,
         maxPixels=1e13,
-        tileScale=4
+        tileScale=8,
+        bestEffort=False,
     )
 
-    groups = ee.Dictionary(grouped.get('groups'))
-    groups_list = groups.get('groups') if groups.contains('groups') else None
+    groups = reduced.get("groups")
+    groups_list = groups.getInfo() if groups is not None else []
 
-    # When EE returns list of dicts like [{'class': 1, 'sum': area_m2}, ...]
-    result = {}
-    if groups_list:
-        records = ee.List(groups_list).getInfo()
-        for rec in records:
-            result[int(rec['class'])] = float(rec['sum'])
+    area_by_class = {v: 0.0 for v in classes}
+    for g in groups_list:
+        cls_val = int(g["class"])
+        if cls_val in area_by_class:
+            area_by_class[cls_val] = float(g["sum"])
+
+    return area_by_class
+
+
+def build_share_table(area_by_class: Dict[int, float], label_map: Dict[int, str], decimals: int = 2):
+    import pandas as pd
+
+    classes = sorted(area_by_class.keys())
+    values_m2 = [area_by_class[c] for c in classes]
+    total_m2 = sum(values_m2)
+
+    labels = [label_map.get(c, f"Class {c}") for c in classes]
+
+    if total_m2 <= 0:
+        df = pd.DataFrame({"HVFE Classes": labels, "Share of the Area (%)": [0.0] * len(classes)})
+        return df, 0.0
+
+    perc_raw = [(v / total_m2) * 100.0 for v in values_m2]
+    perc_rounded = [round(p, decimals) for p in perc_raw]
+
+    target = round(100.0, decimals)
+    diff = round(target - round(sum(perc_rounded), decimals), decimals)
+    if abs(diff) >= (10 ** (-decimals)):
+        idx_max = max(range(len(perc_raw)), key=lambda i: perc_raw[i])
+        perc_rounded[idx_max] = round(perc_rounded[idx_max] + diff, decimals)
+
+    df = pd.DataFrame({"HVFE Classes": labels, "Share of the Area (%)": perc_rounded})
+    return df, total_m2
+
+
+# -----------------------------
+# Export helper (Drive)
+# -----------------------------
+def start_drive_export(
+    image: ee.Image,
+    region: ee.Geometry,
+    scale: int,
+    description: str,
+    file_prefix: str,
+    max_pixels: float = 1e13,
+) -> ee.batch.Task:
+    task = ee.batch.Export.image.toDrive(
+        image=image,
+        description=description,
+        fileNamePrefix=file_prefix,
+        region=region,
+        scale=scale,
+        maxPixels=max_pixels,
+    )
+    task.start()
+    return task
+
+
+def get_task_state(task: ee.batch.Task) -> Tuple[str, Dict]:
+    status = task.status()
+    state = status.get("state", "UNKNOWN")
+    return state, status
+
+
+def render_task_progress(state: str, status: Dict):
+    
+    # this bar is state-based (queue/running/completed/failed).
+    bar = st.progress(0)
+
+    if state == "READY":
+        bar.progress(10)
+        st.info("Task is queued (READY).")
+    elif state == "RUNNING":
+        bar.progress(60)
+        st.info("Task is running, please wait. Please note that the process may take several minutes to complete.")
+    elif state == "COMPLETED":
+        bar.progress(100)
+        st.success("Export completed! Check your Google Drive.")
+    elif state == "FAILED":
+        bar.progress(100)
+        st.error(f"Export failed: {status.get('error_message', 'Unknown error')}")
+    elif state == "CANCELLED":
+        bar.progress(100)
+        st.warning("Export cancelled.")
     else:
-        # Some regions may produce empty results if no overlap
-        result = {}
-
-    return result
+        bar.progress(5)
+        st.warning(f"Task state: {state}")
 
 
-def to_percentage(area_by_class: dict) -> dict:
-    total_area = sum(area_by_class.values()) if area_by_class else 0.0
-    if total_area <= 0:
-        return {c: 0.0 for c in range(1, 8)}
-    return {c: (area_by_class.get(c, 0.0) / total_area) * 100.0 for c in range(1, 8)}
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="HVFE App - Clipping and Stats", layout="wide")
+st.title("HVFE App – Clipping and Statistics")
+st.caption(
+    "Upload a zipped Shapefile (WGS84) or a GeoJSON, select HVFE MIN/MAX raster, visualize, "
+    "extract class shares; and export the clipped raster to Google Drive."
+)
+
+# Initialize EE once
+with st.spinner("Initializing Earth Engine..."):
+    project_used = init_ee()
+
+# Session state defaults
+if "geom" not in st.session_state:
+    st.session_state.geom = None
+if "map_center" not in st.session_state:
+    st.session_state.map_center = None
+if "last_zip_token" not in st.session_state:
+    st.session_state.last_zip_token = None
+if "last_geojson_token" not in st.session_state:
+    st.session_state.last_geojson_token = None
+if "export_task" not in st.session_state:
+    st.session_state.export_task = None
 
 
-# ----------------------------
-# Download clipped raster (GeoTIFF) without Drive export
-# ----------------------------
-def get_geotiff_bytes(image: ee.Image, region: ee.Geometry, scale: int = 30, crs: str = "EPSG:4326") -> tuple[bytes, str]:
-    """
-    Obtain a download URL and fetch bytes for a clipped classification raster as GeoTIFF.
-    Avoids Export to Drive by using getDownloadURL.
-    """
-    params = {
-        "scale": scale,
-        "region": region,
-        "crs": crs,
-        "format": "GEO_TIFF",
-    }
-    url = image.toInt16().getDownloadURL(params)
-    # Fetch the content – in some hosted environments outbound requests may be blocked
-    r = requests.get(url, timeout=600)
-    r.raise_for_status()
-    return r.content, url
+# -----------------------------
+# TOP BAR: uploads + scenario
+# -----------------------------
+top_left, top_right = st.columns([2, 1])
 
-
-# ----------------------------
-# UI – Sidebar
-# ----------------------------
-with st.sidebar:
-    st.header("Options")
-    raster_choice = st.radio("Select raster", ["MIN", "MAX"], index=0, horizontal=True)
-    scale = st.number_input("Analysis scale (meters/pixel)", min_value=10, max_value=500, value=30, step=10,
-                            help="Use a scale close to the native resolution of the dataset.")
+with top_left:
     uploaded_zip = st.file_uploader(
-        "Upload shapefile (.zip with .shp, .shx, .dbf, .prj)",
+        "Upload your Shapefile (.zip with .shp/.shx/.dbf/.prj) in WGS84 (EPSG:4326)",
         type=["zip"],
-        accept_multiple_files=False
+        key="zip_uploader",
     )
-    visualize_btn = st.button("Visualize on Map", use_container_width=True)
-    stats_btn = st.button("Create Pie Chart (Stats %)", use_container_width=True)
-    download_btn = st.button("Download Clipped Raster (GeoTIFF)", use_container_width=True)
+    uploaded_geojson = st.file_uploader(
+        "Or upload a GeoJSON (WGS84/EPSG:4326)", type=["geojson", "json"], key="geojson_uploader"
+    )
+
+with top_right:
+    st.subheader("Select the HVFE Delineation Scenario")
+    scenario = st.radio("HVFE scenario", ["Minimum", "Maximum"], horizontal=True)
+
+# Build selected image (CORRECT)
+img = get_fwc_min() if scenario == "Minimum" else get_fwc_max()
 
 
-# ----------------------------
-# Main layout
-# ----------------------------
-col_map, col_plot = st.columns([1.6, 1.0])
-
-# Store items in session_state to avoid recomputation
-if "ee_geom" not in st.session_state:
-    st.session_state.ee_geom = None
-if "gdf" not in st.session_state:
-    st.session_state.gdf = None
-if "clipped_image" not in st.session_state:
-    st.session_state.clipped_image = None
-if "last_choice" not in st.session_state:
-    st.session_state.last_choice = None
+# -----------------------------
+# Handle uploads ONLY when they CHANGE
+# -----------------------------
+def set_new_geom(geom_obj: ee.Geometry):
+    st.session_state.geom = geom_obj
+    lat, lon = center_of_geometry(geom_obj)
+    st.session_state.map_center = (lat, lon)
 
 
-# ----------------------------
-# Load shapefile and build clipped image
-# ----------------------------
-def prepare_data():
-    if uploaded_zip is None:
-        st.warning("Please upload a zipped shapefile to proceed.")
-        return False
+if uploaded_zip is not None:
+    zip_token = (uploaded_zip.name, getattr(uploaded_zip, "size", None))
+    if st.session_state.last_zip_token != zip_token:
+        with st.spinner("Reading ZIP and extracting shapefile..."):
+            folder = extract_zip_to_temp(uploaded_zip)
+            ok, msg = validate_shapefile_dir(folder)
+            if not ok:
+                st.error(msg)
+            else:
+                try:
+                    geojson_fc = read_shapefile_to_geojson(folder)
+                    geom = geojson_to_ee_geometry(geojson_fc)
+                    set_new_geom(geom)
+                    st.session_state.last_zip_token = zip_token
+                    st.success("Shapefile successfully loaded.")
+                except Exception as e:
+                    st.error(
+                        f"Error reading shapefile: {e}\n\n"
+                        "Tip: Ensure the shapefile is in WGS84 (EPSG:4326), or upload a GeoJSON."
+                    )
 
-    try:
-        ee_geom, gdf = load_shapefile_from_zip(uploaded_zip)
-        st.session_state.ee_geom = ee_geom
-        st.session_state.gdf = gdf
-    except Exception as e:
-        st.error(f"Error reading shapefile: {e}")
-        return False
-
-    try:
-        img = get_fwc_image(raster_choice)
-        st.session_state.last_choice = raster_choice
-        st.session_state.clipped_image = img.clip(st.session_state.ee_geom)
-    except Exception as e:
-        st.error(f"Error building/clipping image: {e}")
-        return False
-
-    return True
-
-
-# ----------------------------
-# Visualize on Map
-# ----------------------------
-if visualize_btn:
-    if prepare_data():
-        with col_map:
-            # Build base map zoomed to shapefile bounds
-            bounds = st.session_state.gdf.total_bounds  # [minx, miny, maxx, maxy]
-            center_lat = (bounds[1] + bounds[3]) / 2.0
-            center_lon = (bounds[0] + bounds[2]) / 2.0
-
-            m = folium.Map(location=[center_lat, center_lon], zoom_start=8, tiles="CartoDB positron")
-
-            # Add EE layer
-            layer_name = f"HVFE {st.session_state.last_choice}"
-            add_ee_layer(m, st.session_state.clipped_image, fwc_vis, layer_name)
-
-            # Add a legend
-            add_legend(m, "HVFE Classes", names, palette)
-
-            # Add layer control
-            folium.LayerControl(collapsed=False).add_to(m)
-
-            st_folium(m, width=None, height=650)
-
-        with col_plot:
-            st.info("Tip: Click 'Create Pie Chart (Stats %)' to compute class percentages for the clipped area.")
-
-
-# ----------------------------
-# Stats & Pie chart
-# ----------------------------
-if stats_btn:
-    if st.session_state.clipped_image is None or st.session_state.ee_geom is None:
-        if not prepare_data():
-            st.stop()
-
-    with st.spinner("Computing class areas and percentages..."):
+elif uploaded_geojson is not None:
+    geojson_token = (uploaded_geojson.name, getattr(uploaded_geojson, "size", None))
+    if st.session_state.last_geojson_token != geojson_token:
         try:
-            areas = compute_area_stats(st.session_state.clipped_image, st.session_state.ee_geom, scale=scale)
-            percentages = to_percentage(areas)
-
-            # Prepare data for the pie
-            class_ids = list(range(1, 8))
-            labels = [names[i-1] for i in class_ids]
-            values = [percentages.get(i, 0.0) for i in class_ids]
-
-            # Color mapping label -> palette color
-            color_map = {labels[i]: palette[i] for i in range(len(labels))}
-
-            fig = px.pie(
-                names=labels,
-                values=values,
-                title="Percentual por classe (clipped area)",
-                color=labels,
-                color_discrete_map=color_map,
-                hole=0.3
-            )
-            fig.update_traces(textposition='inside', texttemplate='%{label}<br>%{value:.2f}%')
-            fig.update_layout(showlegend=False, height=600)
-
-            col_plot.plotly_chart(fig, use_container_width=True)
-
-            # Show a compact table
-            stats_rows = []
-            for i, lbl in enumerate(labels, start=1):
-                stats_rows.append({
-                    "Classe": lbl,
-                    "Área (m²)": round(areas.get(i, 0.0), 2),
-                    "Percentual (%)": round(percentages.get(i, 0.0), 4),
-                })
-            col_plot.subheader("Tabela de estatísticas")
-            col_plot.dataframe(stats_rows, use_container_width=True)
+            geojson_fc = json.load(uploaded_geojson)
+            if geojson_fc.get("type") == "Feature":
+                geojson_fc = {"type": "FeatureCollection", "features": [geojson_fc]}
+            geom = geojson_to_ee_geometry(geojson_fc)
+            set_new_geom(geom)
+            st.session_state.last_geojson_token = geojson_token
+            st.success("GeoJSON successfully loaded.")
         except Exception as e:
-            st.error(f"Error computing stats: {e}")
+            st.error(f"Error reading GeoJSON: {e}")
+
+geom = st.session_state.geom
 
 
-# ----------------------------
-# Download (GeoTIFF)
-# ----------------------------
-if download_btn:
-    if st.session_state.clipped_image is None or st.session_state.ee_geom is None:
-        if not prepare_data():
-            st.stop()
+# -----------------------------
+# MAIN DASHBOARD: map (left) + panel (right)
+# -----------------------------
+left, right = st.columns([2, 1.1])
 
-    with st.spinner("Preparing GeoTIFF for download..."):
+with left:
+    st.subheader("Map")
+    if geom is None:
+        st.info("Upload a zipped Shapefile (WGS84) or a GeoJSON to enable map, stats, and export.")
+    else:
+        clipped_current = img.clip(geom)
+
+        lat, lon = st.session_state.get("map_center", center_of_geometry(geom))
+        m = folium.Map(location=[lat, lon], zoom_start=9, tiles="OpenStreetMap")
+
+        add_ee_tile_layer(m, clipped_current, FWC_VIS, f"HVFE {scenario}")
+
+        # AOI outline
         try:
-            content, url = get_geotiff_bytes(st.session_state.clipped_image, st.session_state.ee_geom, scale=scale)
-            now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            fname = f"HVFE_{st.session_state.last_choice}_clipped_{now}.tif"
+            aoi_geojson = ee.FeatureCollection([ee.Feature(geom)]).getInfo()
+            folium.GeoJson(
+                aoi_geojson,
+                name="AOI",
+                style_function=lambda x: {"fillColor": "#00000000", "color": "#333333", "weight": 2},
+            ).add_to(m)
+        except Exception:
+            folium.CircleMarker(location=[lat, lon], radius=6, color="#333", fill=True).add_to(m)
 
-            st.download_button(
-                label="Download GeoTIFF",
-                data=content,
-                file_name=fname,
-                mime="image/tiff",
-                use_container_width=True
-            )
-            st.caption("If the button fails due to outbound HTTP restrictions, use the direct link below:")
-            st.code(url, language="text")
-        except Exception as e:
-            st.error(f"Error fetching GeoTIFF: {e}")
-            st.info("If you're running in a restricted environment, try running locally or use the direct URL approach via getDownloadURL.")
-``
+        folium.LayerControl().add_to(m)
+
+        # Legend inside the map
+        if scenario == "Minimum":
+            add_legend_to_map(m, MIN_CLASS_LABELS, PALETTE_HEX)
+        else:
+            add_legend_to_map(m, MAX_CLASS_LABELS, PALETTE_HEX)
+
+        st_folium(m, use_container_width=True, height=780, key="map_view")
+
+
+with right:
+    st.subheader("Stats")
+
+    if geom is None:
+        st.caption("Waiting for an AOI upload...")
+    else:
+        clipped_img = img.clip(geom)
+
+        # Classes/labels
+        if scenario == "Minimum":
+            classes = [1, 2, 3, 4, 5]
+            label_map = MIN_CLASS_LABELS
+        else:
+            classes = [1, 2, 3, 4, 5, 6, 7]
+            label_map = MAX_CLASS_LABELS
+
+        if st.button("📊 Compute class shares"):
+            with st.spinner("Computing class statistics..."):
+                try:
+                    area_by_class = compute_area_by_classes(clipped_img, geom, classes, scale=SCALE_M)
+                    df, total_m2 = build_share_table(area_by_class, label_map, decimals=2)
+
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.markdown(f"**Overall HVFE area:** {total_m2/1e6:.3f} km²")
+                except Exception as e:
+                    st.error(f"Error computing stats: {e}")
+
+        st.divider()
+
+        # --- Export (Google Drive) ---
+        st.subheader("Export clipped HVFE raster (Google Drive)")
+
+        st.caption("⚠️ The GeoTIFF will be saved to your Google Drive account.")
+
+        # customizing export name without changing the rest of the app logic
+        export_name = st.text_input("Export name (Drive)", value="hvfe_clip")
+
+        if st.button("⬆️ Export to Google Drive"):
+            with st.spinner("Submitting export task to Earth Engine..."):
+                try:
+                    # 1) Rectangular bounding box of AOI (not shown on map)
+                    bbox = geom.bounds(1)
+
+                    # 2) Clip scenario raster by bounding box for export
+                    
+                    img_to_export = img.clip(bbox).toByte()
+
+                    task = start_drive_export(
+                        image=img_to_export,
+                        region=bbox,
+                        scale=SCALE_M,
+                        description=export_name,
+                        file_prefix=export_name,
+                    )
+
+                    st.session_state.export_task = task
+                    st.success("Export task submitted! You can monitor the status below by clicking on the 'Refresh export status' button. Please note that the process may take several minutes to complete.")
+                except Exception as e:
+                    st.error(f"Error submitting export task: {e}")
+
+        # --- Progress monitoring ---
+        task = st.session_state.export_task
+        if task is not None:
+            state, status = get_task_state(task)
+            render_task_progress(state, status)
+
+            # Show a couple helpful details
+            #if "creation_timestamp_ms" in status:
+            #   st.caption(f"Task created (ms): {status['creation_timestamp_ms']}")
+            #if "id" in status:
+            #    st.caption(f"Task id: {status['id']}")
+
+            if st.button("🔄 Refresh export status"):
+                st.rerun()
